@@ -2,9 +2,11 @@ package downloader
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/go-faster/errors"
 	"github.com/gotd/td/telegram/downloader"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
@@ -37,27 +39,33 @@ func (d *Downloader) Download(ctx context.Context, limit int) error {
 	wg, wgctx := errgroup.WithContext(ctx)
 	wg.SetLimit(limit)
 
+	failed := atomic.NewInt64(0)
 	for d.opts.Iter.Next(wgctx) {
 		elem := d.opts.Iter.Value()
 
-		wg.Go(func() (rerr error) {
+		wg.Go(func() error {
 			d.opts.Progress.OnAdd(elem)
-			defer func() { d.opts.Progress.OnDone(elem, rerr) }()
 
-			if err := d.download(wgctx, elem); err != nil {
-				// canceled by user, so we directly return error to stop all
-				if errors.Is(err, context.Canceled) {
-					return errors.Wrap(err, "download")
-				}
-
-				// don't return error, just log it
-				logctx.
-					From(ctx).
-					Error("Download error",
-						zap.Any("element", elem),
-						zap.Error(err),
-					)
+			err := d.download(wgctx, elem)
+			d.opts.Progress.OnDone(elem, err)
+			if err == nil {
+				return nil
 			}
+
+			// interrupted by user, so we directly return error to stop all.
+			// Errors of the connection may also wrap context.Canceled, so check the context itself.
+			if ctx.Err() != nil {
+				return errors.Wrap(err, "download")
+			}
+
+			// don't stop other downloads, just log the error
+			failed.Inc()
+			logctx.
+				From(ctx).
+				Error("Download error",
+					zap.String("element", elemString(elem)),
+					zap.Error(err),
+				)
 
 			return nil
 		})
@@ -67,7 +75,22 @@ func (d *Downloader) Download(ctx context.Context, limit int) error {
 		return errors.Wrap(err, "iter")
 	}
 
-	return wg.Wait()
+	if err := wg.Wait(); err != nil {
+		return err
+	}
+
+	if n := failed.Load(); n > 0 {
+		return errors.Errorf("failed to download %d file(s), see log for details", n)
+	}
+
+	return nil
+}
+
+func elemString(elem Elem) string {
+	if s, ok := elem.(fmt.Stringer); ok {
+		return s.String()
+	}
+	return fmt.Sprintf("%T", elem)
 }
 
 func (d *Downloader) download(ctx context.Context, elem Elem) error {
@@ -78,7 +101,7 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 	}
 
 	logctx.From(ctx).Debug("Start download elem",
-		zap.Any("elem", elem))
+		zap.String("elem", elemString(elem)))
 
 	client := d.opts.Pool.Client(ctx, elem.File().DC())
 	if elem.AsTakeout() {
@@ -86,7 +109,7 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 	}
 
 	_, err := downloader.NewDownloader().WithPartSize(MaxPartSize).
-		Download(client, elem.File().Location()).
+		Download(newClient(client, elem), elem.File().Location()).
 		WithThreads(tutil.BestThreads(elem.File().Size(), d.opts.Threads)).
 		Parallel(ctx, newWriteAt(elem, d.opts.Progress, MaxPartSize))
 	if err != nil {

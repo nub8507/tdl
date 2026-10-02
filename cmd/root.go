@@ -79,6 +79,13 @@ func New() *cobra.Command {
 			cmd.SetContext(logctx.With(cmd.Context(),
 				logutil.New(level, filepath.Join(consts.LogPath, "latest.log"))))
 
+			// to know which build is running
+			exe, _ := os.Executable()
+			logctx.From(cmd.Context()).Info("Version",
+				zap.String("version", consts.Version),
+				zap.String("commit", consts.Commit),
+				zap.String("executable", exe))
+
 			ns := viper.GetString(consts.FlagNamespace)
 			if ns != "" {
 				logctx.From(cmd.Context()).Info("Namespace",

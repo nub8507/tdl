@@ -32,7 +32,16 @@ import (
 	"github.com/iyear/tdl/pkg/utils"
 )
 
-const tempExt = ".tmp"
+const (
+	tempExt = ".tmp"
+	// journal of downloaded parts is kept next to the temp file until download is finished
+	journalExt = ".journal"
+)
+
+type msgKey struct {
+	peer int64
+	msg  int
+}
 
 type fileTemplate struct {
 	DialogID     int64
@@ -56,6 +65,7 @@ type iter struct {
 
 	mu          *sync.Mutex
 	finished    map[int]struct{}
+	seen        map[msgKey]struct{} // messages already met in this run
 	fingerprint string
 	// This param is kept for potential future use but is currently unused.
 	// preSum       []int
@@ -106,6 +116,7 @@ func newIter(pool dcpool.Pool, manager *peers.Manager, dialog [][]*tmessage.Dial
 
 		mu:          &sync.Mutex{},
 		finished:    make(map[int]struct{}),
+		seen:        make(map[msgKey]struct{}),
 		fingerprint: fingerprint(dialogs),
 		// This param is kept for potential future use but is currently unused.
 		// preSum:       preSum(dialogs),
@@ -195,8 +206,9 @@ func (i *iter) process(ctx context.Context) (ret bool, skip bool) {
 		return i.processGrouped(ctx, message, from, startLogicalPos)
 	}
 
-	// check if finished
-	if _, ok := i.finished[startLogicalPos]; ok {
+	// check if finished or already queued in this run
+	first := i.markSeen(from.ID(), message.ID)
+	if _, ok := i.finished[startLogicalPos]; ok || !first {
 		i.logicalPos++ // increment logical position even if skipped
 		return false, true
 	}
@@ -259,10 +271,28 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 		return false, false
 	}
 
-	to, err := os.Create(path)
+	to, journal, err := i.openFile(path, item)
 	if err != nil {
-		i.err = errors.Wrap(err, "create file")
+		logctx.From(ctx).Error("Open download file",
+			zap.String("file", path),
+			zap.Error(err),
+		)
+		i.err = err
 		return false, false
+	}
+
+	log := logctx.From(ctx).With(
+		zap.String("journal", journal.Path()),
+		zap.Int("parts", journal.Done()),
+		zap.Int("total", journal.Total()),
+	)
+	switch {
+	case journal.Done() > 0:
+		log.Info("Continue partially downloaded file")
+	case journal.Discarded():
+		log.Info("Journal of the previous download can't be used, download from scratch")
+	default:
+		log.Info("Download journal opened")
 	}
 
 	i.elem <- &iterElem{
@@ -273,12 +303,64 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 		fromMsg: message,
 		file:    item,
 
-		to: to,
+		to:      to,
+		journal: journal,
 
+		pool: i.pool,
 		opts: i.opts,
 	}
 
 	return true, false
+}
+
+// openFile opens temp file of the download with its journal.
+// Parts written by the previous downloads are kept, unless restart is requested.
+func (i *iter) openFile(path string, item *tmedia.Media) (_ *os.File, _ *downloader.Journal, rerr error) {
+	to, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "create file")
+	}
+	defer func() {
+		if rerr != nil {
+			_ = to.Close()
+		}
+	}()
+
+	var available int64
+	if !i.opts.Restart {
+		stat, err := to.Stat()
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "stat file")
+		}
+		available = stat.Size()
+	}
+
+	id, _ := tmedia.LocationID(item.InputFileLoc)
+	journal, err := downloader.OpenJournal(path+journalExt, item.Size, id, available)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// nothing to continue from, drop the data left by the previous download
+	if journal.Done() == 0 {
+		if err = to.Truncate(0); err != nil {
+			_ = journal.Close()
+			return nil, nil, errors.Wrap(err, "truncate file")
+		}
+	}
+
+	return to, journal, nil
+}
+
+// markSeen reports whether the message is met for the first time in this run.
+func (i *iter) markSeen(peer int64, msg int) bool {
+	key := msgKey{peer: peer, msg: msg}
+	if _, ok := i.seen[key]; ok {
+		return false
+	}
+
+	i.seen[key] = struct{}{}
+	return true
 }
 
 func (i *iter) processGrouped(ctx context.Context, message *tg.Message, from peers.Peer, startLogicalPos int) (bool, bool) {
@@ -293,8 +375,12 @@ func (i *iter) processGrouped(ctx context.Context, message *tg.Message, from pee
 	for idx, msg := range grouped {
 		logicalPos := startLogicalPos + idx
 
+		// every message of the album resolves to the whole album,
+		// so skip messages already queued in this run
+		first := i.markSeen(from.ID(), msg.ID)
+
 		// check if this grouped message is already finished
-		if _, ok := i.finished[logicalPos]; ok {
+		if _, ok := i.finished[logicalPos]; ok || !first {
 			continue
 		}
 

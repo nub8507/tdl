@@ -24,6 +24,17 @@ func ExtractMedia(m tg.MessageMediaClass) (*Media, bool) {
 	return nil, false
 }
 
+// LocationID returns id of the document or photo the location points to.
+func LocationID(loc tg.InputFileLocationClass) (int64, bool) {
+	switch l := loc.(type) {
+	case *tg.InputDocumentFileLocation:
+		return l.ID, true
+	case *tg.InputPhotoFileLocation:
+		return l.ID, true
+	}
+	return 0, false
+}
+
 func GetMedia(msg tg.MessageClass) (*Media, bool) {
 	mm, ok := msg.(*tg.Message)
 	if !ok {

@@ -2,7 +2,6 @@ package dl
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,14 +12,17 @@ import (
 	"github.com/gabriel-vasile/mimetype"
 	"github.com/go-faster/errors"
 	pw "github.com/jedib0t/go-pretty/v6/progress"
+	"go.uber.org/zap"
 
 	"github.com/iyear/tdl/core/downloader"
+	"github.com/iyear/tdl/core/logctx"
 	"github.com/iyear/tdl/core/util/fsutil"
 	"github.com/iyear/tdl/pkg/prog"
 	"github.com/iyear/tdl/pkg/utils"
 )
 
 type progress struct {
+	ctx      context.Context // context of the whole download, done when it's interrupted
 	pw       pw.Writer
 	trackers *sync.Map // map[ID]*pw.Tracker
 	opts     Options
@@ -28,8 +30,9 @@ type progress struct {
 	it *iter
 }
 
-func newProgress(p pw.Writer, it *iter, opts Options) *progress {
+func newProgress(ctx context.Context, p pw.Writer, it *iter, opts Options) *progress {
 	return &progress{
+		ctx:      ctx,
 		pw:       p,
 		trackers: &sync.Map{},
 		opts:     opts,
@@ -62,16 +65,25 @@ func (p *progress) OnDone(elem downloader.Elem, err error) {
 	}
 	t := tracker.(*pw.Tracker)
 
-	if err := e.to.Close(); err != nil {
-		p.fail(t, elem, errors.Wrap(err, "close file"))
-		return
+	if cerr := e.close(); cerr != nil && err == nil {
+		err = errors.Wrap(cerr, "close file")
+	}
+	if err == nil && !e.journal.Complete() {
+		err = errors.Errorf("incomplete download: %d of %d parts", e.journal.Done(), e.journal.Total())
 	}
 
+	log := logctx.From(p.ctx).With(
+		zap.String("journal", e.journal.Path()),
+		zap.Int("parts", e.journal.Done()),
+		zap.Int("total", e.journal.Total()),
+	)
+
+	// temp file and its journal are kept to continue the download next time
 	if err != nil {
-		if !errors.Is(err, context.Canceled) { // don't report user cancel
+		log.Info("Download journal kept to continue the download", zap.Error(err))
+		if p.ctx.Err() == nil { // don't report user cancel
 			p.fail(t, elem, errors.Wrap(err, "progress"))
 		}
-		_ = os.Remove(e.to.Name()) // just try to remove temp file, ignore error
 		return
 	}
 
@@ -80,6 +92,17 @@ func (p *progress) OnDone(elem downloader.Elem, err error) {
 	if err := p.donePost(e); err != nil {
 		p.fail(t, elem, errors.Wrap(err, "post file"))
 		return
+	}
+
+	if err := e.journal.Remove(); err != nil {
+		log.Warn("Remove download journal", zap.Error(err))
+		p.pw.Log(color.YellowString("%s: remove journal: %s", p.elemString(elem), err.Error()))
+	} else {
+		log.Info("Download finished, journal removed")
+	}
+
+	if !t.IsDone() {
+		t.MarkAsDone()
 	}
 }
 
@@ -123,10 +146,5 @@ func (p *progress) processMessage(elem downloader.Elem) string {
 }
 
 func (p *progress) elemString(elem downloader.Elem) string {
-	e := elem.(*iterElem)
-	return fmt.Sprintf("%s(%d):%d -> %s",
-		e.from.VisibleName(),
-		e.from.ID(),
-		e.fromMsg.ID,
-		strings.TrimSuffix(e.to.Name(), tempExt))
+	return elem.(*iterElem).String()
 }
